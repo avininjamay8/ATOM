@@ -1274,9 +1274,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # indices below are positions in the allocated rows.
         num_layers = self.kv_pool.layers
 
-        # A row of each is one scheduler block, so `stride(0)` is already the
-        # bytes a transfer moves per block -- no `block_ratio` after the fact,
-        # and no per-field override to keep in step with the pooling ones.
+        # Each pool view is already [scheduler blocks, physical rows, width].
+        # Publish the same storage to P/D and MP so their byte geometry agrees,
+        # including compact or pooled index caches with a different row count.
+        region_tensors = self.kv_pool.region_tensors()
         block_regions = [
             KVTransferRegion(
                 base_addr=t.data_ptr(),
@@ -1284,8 +1285,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 unit_bytes=t.stride(0) * t.element_size(),
                 semantic_role=f"mla.{role}",
             )
-            for role, t in self.kv_pool.region_tensors()
+            for role, t in region_tensors
         ]
+        block_tensor_views = [t for _, t in region_tensors]
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1382,7 +1384,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
+            block_tensor_views=block_tensor_views,
             block_region_consumer_indices=block_region_consumer_indices,
+            # MLA's latent projection is replicated across TP. Sparse MLA's
+            # index-key projection/cache is replicated as well; only the query
+            # heads and absorbed KV-B/output projections are TP-sharded.
+            # Consequently every PAGE byte published above is identical on
+            # every TP worker (DCP/PCP are separate axes and are rejected by
+            # the current LMCache MP connector).
+            tp_replication_factor=int(
+                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            ),
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
