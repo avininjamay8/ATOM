@@ -587,6 +587,7 @@ def _fake_head(batch):
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
+        _dispatch_idle_offload_work=MagicMock(),
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None

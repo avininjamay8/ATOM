@@ -1996,6 +1996,24 @@ class TestStalledOffloadSaveReclaim:
         # Notified with the string request id, matching the connector's sid keys.
         assert abandoned == ["1"]
 
+    def test_save_timeout_does_not_release_a_pending_producer_send(self, monkeypatch):
+        import time as _time
+
+        seq = SimpleNamespace(
+            id=1,
+            _deferred_save_at=_time.monotonic() - 500.0,
+            _awaiting_kv_send=True,
+        )
+        s, freed = self._sched(monkeypatch, [seq])
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert not freed
+        assert seq.id in s.deferred_free_blocks
+
+        seq._awaiting_kv_send = False
+        s._next_save_reconcile_at = 0
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [seq.id]
+
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
         import time as _time
 

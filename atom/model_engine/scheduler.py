@@ -882,8 +882,15 @@ class Scheduler:
             callback(str(seq.id))
 
     def _maybe_release_deferred(self, seq: Sequence) -> None:
+        """Release only after the producer send and all offload work finish.
+
+        Save completions also drive incremental prefill saves, so they may
+        arrive before the send, or before the final suffix is even dispatched.
+        The connector's predicate covers both in-flight and undispatched work.
+        """
         if (
             seq.id not in self.deferred_free_blocks
+            or getattr(seq, "_awaiting_kv_send", False)
             or getattr(seq, "_awaiting_aborted_load_cleanup", False)
             or self._connector_should_defer_free(seq)
         ):
@@ -947,6 +954,7 @@ class Scheduler:
             seq
             for seq in list(self.deferred_free_blocks.values())
             if getattr(seq, "_deferred_save_at", None) is not None
+            and not getattr(seq, "_awaiting_kv_send", False)
             and now - seq._deferred_save_at >= timeout
         ]
         for seq in stalled:
@@ -2858,6 +2866,7 @@ class Scheduler:
                         "Deferring block free for seq %s until KV send completes.",
                         seq.id,
                     )
+                    seq._awaiting_kv_send = True
                     self.deferred_free_blocks[seq.id] = seq
                 elif self._connector_should_defer_free(seq):
                     logger.debug(
@@ -3084,8 +3093,8 @@ class Scheduler:
         """Reconcile scheduler state with completed KV transfers.
 
         * ``finished_recving``: marks requests as ready for decode scheduling.
-        * ``finished_sending``: releases deferred block allocations on the
-          producer side.
+        * ``finished_sending``: releases the producer's send ownership; blocks
+          remain deferred while the connector still has offload work.
         """
         if kv_connector_output is None:
             return
@@ -3160,14 +3169,19 @@ class Scheduler:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
-            self.deferred_free_blocks.pop(seq.id, None)
-            self.block_manager.deallocate(seq)
+            seq._awaiting_kv_send = False
+            # Start save reclamation only after RDMA releases its ownership.
+            if (
+                self._connector_should_defer_free(seq)
+                and getattr(seq, "_deferred_save_at", None) is None
+            ):
+                seq._deferred_save_at = time.monotonic()
+            self._maybe_release_deferred(seq)
 
-        if not is_producer:
-            for req_id in finished_saving:
-                seq = self._deferred_sequence(req_id)
-                if seq is not None:
-                    self._maybe_release_deferred(seq)
+        for req_id in finished_saving:
+            seq = self._deferred_sequence(req_id)
+            if seq is not None:
+                self._maybe_release_deferred(seq)
 
         # The state-offload store reports, not keyed by request: by the time a
         # store lands its owner is long gone and only the hash remains. They
