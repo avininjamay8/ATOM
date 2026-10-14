@@ -17,6 +17,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import msgpack
@@ -45,7 +46,10 @@ from atom.kv_transfer.disaggregation.types import (
     ReqMeta,
     TransferId,
 )
-from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
+from atom.kv_transfer.disaggregation.utils import (
+    MAX_RDMA_CHUNK_BYTES,
+    chunk_tensor_for_rdma,
+)
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
     get_open_port,
@@ -64,6 +68,20 @@ if _MORIIO_AVAILABLE:
     )
 
 logger = logging.getLogger("atom")
+
+# Prefix of a sidecar plane's key in the handshake's metadata dict, which
+# otherwise maps layer names to their K/V descriptors.
+_SIDECAR_KEY_PREFIX = "sidecar:"
+
+
+@dataclass(frozen=True)
+class _SidecarPlane:
+    """One registered block-indexed region outside the per-layer K/V."""
+
+    name: str
+    per_block_bytes: int
+    blocks_per_chunk: int
+    num_chunks: int
 
 
 # ===================================================================
@@ -168,6 +186,14 @@ class MoRIIOConnector(KVConnectorBase):
         self.kv_cache_block_size: int = config.kv_cache_block_size
         self.blocks_per_chunk: int | None = None
         self.num_k_chunks: int = 0
+
+        # Block-indexed regions a layer's K and V do not cover -- an fp8
+        # cache's per-token scales, MiniMax-M3's indexer keys. Decode reads
+        # them next to the KV, so a transfer that leaves them behind hands it
+        # fp8 bytes dequantized by whatever scales its own blocks last held.
+        self._sidecar_planes: list[_SidecarPlane] = []
+        self._local_sidecar_metadata: dict[str, list[bytes]] = {}
+        self._built_sidecar_sessions: dict[str, list[dict]] = {}
 
         # Session cache: remote_engine_id -> list[session]
         self._built_sessions: defaultdict[str, list] = defaultdict(list)
@@ -300,6 +326,8 @@ class MoRIIOConnector(KVConnectorBase):
             self.blocks_per_chunk,
         )
 
+        self._register_sidecar_planes(kv_caches, transfer_tensors)
+
         # Extract block geometry from the last registered tensor
         is_mla = len(cache_tensor.shape) == 3
         self.block_len = self.kv_cache_block_size
@@ -324,12 +352,89 @@ class MoRIIOConnector(KVConnectorBase):
                 self.side_channel_port,
                 self.tp_rank,
                 self.dp_rank,
-                self.layer_name_to_local_kv_cache_metadata,
+                {
+                    **self.layer_name_to_local_kv_cache_metadata,
+                    **{
+                        _SIDECAR_KEY_PREFIX + name: metas
+                        for name, metas in self._local_sidecar_metadata.items()
+                    },
+                },
             ),
             daemon=True,
             name="moriio-handshake-listener",
         )
         self._handshake_listener_thread.start()
+
+    def _register_sidecar_planes(
+        self, kv_caches: dict[str, Any], transfer_tensors: Any
+    ) -> None:
+        """Register the block regions of ``transfer_tensors`` K/V left out.
+
+        A region already registered as some layer's K or V starts at that
+        tensor's address; every other one is a plane decode reads per block,
+        addressed like Mooncake's ``base + block_id * unit_bytes``.
+        """
+        regions = list(getattr(transfer_tensors, "block_regions", None) or [])
+        unsupported = [
+            name
+            for name in ("swa_block_regions", "slot_regions")
+            if getattr(transfer_tensors, name, None)
+        ]
+        if unsupported:
+            logger.error(
+                "MoRIIO does not transfer %s; decode will run without that "
+                "state",
+                ", ".join(unsupported),
+            )
+        covered = set()
+        for kv_cache in kv_caches.values():
+            for tensor in (kv_cache.k_cache, kv_cache.v_cache):
+                if tensor is not None:
+                    covered.add(tensor.data_ptr())
+
+        device_id = next(
+            (
+                kv.k_cache.device.index
+                for kv in kv_caches.values()
+                if kv.k_cache.device.index is not None
+            ),
+            -1,
+        )
+        for idx, region in enumerate(regions):
+            if region.base_addr in covered:
+                continue
+            if region.reverse_indexed:
+                raise ValueError(
+                    f"block region {region.semantic_role or idx} is reverse "
+                    "indexed, which MoRIIO's offsets do not implement"
+                )
+            name = region.semantic_role or f"region_{idx}"
+            unit = region.unit_bytes
+            bpc = max(1, MAX_RDMA_CHUNK_BYTES // unit)
+            total_blocks = region.total_bytes // unit
+            metas = []
+            for start in range(0, total_blocks, bpc):
+                size = (min(start + bpc, total_blocks) - start) * unit
+                metas.append(
+                    self.moriio_wrapper.register_local_buffer(
+                        region.base_addr + start * unit, size, device_id
+                    )
+                )
+            if name in self._local_sidecar_metadata:
+                raise ValueError(f"two block regions are both named {name!r}")
+            self._local_sidecar_metadata[name] = metas
+            self._sidecar_planes.append(
+                _SidecarPlane(name, unit, bpc, len(metas))
+            )
+
+        if self._sidecar_planes:
+            logger.info(
+                "RDMA sidecar registration: %d planes beyond K/V (%s)",
+                len(self._sidecar_planes),
+                ", ".join(
+                    sorted({p.name.rsplit(".layer_", 1)[0] for p in self._sidecar_planes})
+                ),
+            )
 
     @staticmethod
     def _transfer_mode_from(kv_transfer_config: dict, environ=os.environ) -> str:
@@ -723,6 +828,69 @@ class MoRIIOConnector(KVConnectorBase):
             self.remote_moriio_metadata[remote_engine_id],
         )
 
+    def _get_or_build_sidecar_sessions(self, remote_engine_id: str) -> list[dict]:
+        """Chunk-pair sessions per sidecar plane, in ``_sidecar_planes`` order.
+
+        Raises when the peer did not advertise a plane we hold: moving the KV
+        without it is the silent corruption these planes exist to prevent.
+        """
+        planes = getattr(self, "_sidecar_planes", ())
+        if not planes:
+            return []
+        built = self._built_sidecar_sessions.get(remote_engine_id)
+        if built is not None:
+            return built
+
+        remote = self.layer_name_to_remote_kv_cache_metadata[remote_engine_id]
+        remote_planes = {
+            k[len(_SIDECAR_KEY_PREFIX) :] for k in remote if k.startswith(_SIDECAR_KEY_PREFIX)
+        }
+        missing = [p.name for p in planes if p.name not in remote_planes]
+        if missing:
+            raise ValueError(
+                f"{remote_engine_id} advertised no descriptors for {len(missing)} "
+                f"of our {len(planes)} sidecar planes (first {missing[0]!r}); "
+                "its KV would arrive without them"
+            )
+        built = []
+        for plane in planes:
+            local_metas = self._local_sidecar_metadata[plane.name]
+            # Chunk counts may differ: P and D size their pools independently.
+            remote_metas = remote[_SIDECAR_KEY_PREFIX + plane.name]
+            sessions = {}
+            for lci, local_packed in enumerate(local_metas):
+                local_md = self.moriio_wrapper.get_unpack_memory_metadata(local_packed)
+                for rci, remote_packed in enumerate(remote_metas):
+                    remote_md = self.moriio_wrapper.get_unpack_memory_metadata(
+                        remote_packed
+                    )
+                    sessions[(lci, rci)] = self.moriio_wrapper.build_session(
+                        local_md, remote_md
+                    )
+            built.append(sessions)
+        logger.info(
+            "Built sessions for %d sidecar planes for %s", len(built), remote_engine_id
+        )
+        self._built_sidecar_sessions[remote_engine_id] = built
+        return built
+
+    def _sidecar_groups(
+        self, local_block_ids: list[int], remote_block_ids: list[int]
+    ) -> list[tuple[dict, dict]]:
+        """``(groups, plane)`` offsets per sidecar plane, at its own block size."""
+        return [
+            (
+                self._group_offsets(
+                    local_block_ids,
+                    remote_block_ids,
+                    plane.per_block_bytes,
+                    plane.blocks_per_chunk,
+                ),
+                plane,
+            )
+            for plane in getattr(self, "_sidecar_planes", ())
+        ]
+
     def _verify_rows_for(self, local_block_ids: list[int], is_mla: bool) -> Any:
         """Row indices into dim 0 covered by the given blocks.
 
@@ -903,6 +1071,17 @@ class MoRIIOConnector(KVConnectorBase):
                     with self.moriio_wrapper.lock:
                         self._recving_transfers[request_id].append(status)
 
+        sidecar_sessions = self._get_or_build_sidecar_sessions(dp_engine_id)
+        for sessions_for_plane, (plane_groups, _plane) in zip(
+            sidecar_sessions, self._sidecar_groups(local_block_ids, remote_block_ids)
+        ):
+            for (lci, rci), (l_offs, r_offs, szs) in plane_groups.items():
+                status = self.moriio_wrapper.read_remote_data(
+                    szs, l_offs, r_offs, sessions_for_plane[(lci, rci)]
+                )
+                with self.moriio_wrapper.lock:
+                    self._recving_transfers[request_id].append(status)
+
         logger.debug(
             "RDMA read issued for req %s (%d layers, %d chunk groups) "
             "from %s (dp_rank=%d, notify_port=%d)",
@@ -962,6 +1141,7 @@ class MoRIIOConnector(KVConnectorBase):
         local_block_ids: list[int],
         remote_block_ids: list[int],
         per_block_bytes: int,
+        blocks_per_chunk: int | None = None,
     ) -> dict[tuple[int, int], tuple[list[int], list[int], list[int]]]:
         """Chunk-relative byte offsets of each block pair, grouped by chunk pair.
 
@@ -970,7 +1150,7 @@ class MoRIIOConnector(KVConnectorBase):
         on the matching session of the NxN grid. Shared by both directions, so
         a read and a write of the same pair always touch the same bytes.
         """
-        bpc = self.blocks_per_chunk
+        bpc = blocks_per_chunk or self.blocks_per_chunk
         groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
         for lb, rb in zip(local_block_ids, remote_block_ids):
             key = (lb // bpc, rb // bpc)
@@ -1013,6 +1193,16 @@ class MoRIIOConnector(KVConnectorBase):
                             szs, l_offs, r_offs, v_sessions[(lci, rci)]
                         )
                     )
+        sidecar_sessions = self._get_or_build_sidecar_sessions(engine_id)
+        for sessions_for_plane, (plane_groups, _plane) in zip(
+            sidecar_sessions, self._sidecar_groups(src[: len(dst)], dst)
+        ):
+            for (lci, rci), (l_offs, r_offs, szs) in plane_groups.items():
+                statuses.append(
+                    self.moriio_wrapper.write_remote_data_status(
+                        szs, l_offs, r_offs, sessions_for_plane[(lci, rci)]
+                    )
+                )
         logger.debug(
             "RDMA write issued for transfer %s: %d blocks, %d layers, %d chunk "
             "groups to %s",
