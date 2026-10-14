@@ -1577,6 +1577,39 @@ models:
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
+        - &minimax_fp8_pd_tp8
+          name: minimax-m3-fp8-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        # The 2P1D TP8 cell with only the connector swapped. MiniMax-M3's fp8
+        # KV carries per-token scales and indexer keys beside K/V, so this is
+        # the cell that shows whether MoRI IO moves all of them.
+        - <<: *minimax_fp8_pd_tp8
+          name: minimax-m3-fp8-2p1d-tp8-moriio
+          topology: 2p1d_moriio
+          display_topology: 2P1D-MORIIO-TP8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+
         - name: minimax-m3-fp8-1p1d-tp4-eagle3
           topology: 1p1d_eagle3
           pd_worker_layout: single_node
