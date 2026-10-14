@@ -592,6 +592,46 @@ class WritePathTest(unittest.TestCase):
             ),
         )
 
+    def with_sidecar(self, conn, remote_planes=("mha.g.k_scale.layer_0",)):
+        from atom.kv_transfer.disaggregation.moriio.moriio_connector import (
+            _SIDECAR_KEY_PREFIX,
+            _SidecarPlane,
+        )
+
+        # 3-byte blocks, 2 per chunk: block ids land in other chunks than K/V's.
+        conn._sidecar_planes = [_SidecarPlane("mha.g.k_scale.layer_0", 3, 2, 3)]
+        conn._local_sidecar_metadata = {"mha.g.k_scale.layer_0": [b"l0", b"l1", b"l2"]}
+        conn._built_sidecar_sessions = {}
+        conn.layer_name_to_remote_kv_cache_metadata = {
+            "engine": {_SIDECAR_KEY_PREFIX + n: [b"r0", b"r1", b"r2"] for n in remote_planes}
+        }
+        conn.moriio_wrapper.get_unpack_memory_metadata = lambda packed: packed
+        conn.moriio_wrapper.build_session = lambda l, r: f"S-{l.decode()}{r.decode()}"
+        return conn
+
+    def test_the_producer_also_writes_the_sidecar_planes(self):
+        conn = self.with_sidecar(self.make(producer=True))
+        sessions = [({(0, 0): f"L{i}-00", (0, 1): f"L{i}-01"}, {}) for i in range(2)]
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        request = self.push_request(dst_block_ids=[5, 1], src_block_ids=[2, 3, 7])
+
+        statuses = conn._write_blocks(request, "engine")
+
+        # 4 K/V writes as before, plus one per (src chunk, dst chunk) pair of
+        # the plane: src 2 -> dst 5 is chunk 1 -> 2, src 3 -> dst 1 is 1 -> 0.
+        self.assertEqual(len(statuses), 6)
+        sidecar = sorted(
+            (s, l, r) for s, l, r, _ in conn.writes if s.startswith("S-")
+        )
+        self.assertEqual(sidecar, [("S-l1r0", [3], [3]), ("S-l1r2", [0], [3])])
+
+    def test_a_peer_without_our_sidecar_planes_is_refused(self):
+        conn = self.with_sidecar(self.make(producer=True), remote_planes=())
+        conn._get_or_build_sessions = lambda engine_id: ([], None)
+        with self.assertRaises(ValueError) as caught:
+            conn._write_blocks(self.push_request(), "engine")
+        self.assertIn("sidecar planes", str(caught.exception))
+
     def test_the_producer_refuses_a_short_source(self):
         conn = self.make(producer=True)
         conn._get_or_build_sessions = lambda engine_id: ([], None)
