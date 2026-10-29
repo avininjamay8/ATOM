@@ -68,7 +68,9 @@ decode_args=(--decode http://decode:8020)
 start_router
 """
 
-    def router_args(self, cell, policy=None, kind=None):
+    def router_args(
+        self, cell, policy=None, kind=None, xP="1", prefill_extra=None, decode_extra=None
+    ):
         service = cell["service"]
         result = subprocess.run(
             ["bash", "-eu", "-c", self.script],
@@ -79,12 +81,20 @@ start_router
                 ATOMESH_MESH_BINARY="/test/atomesh",
                 ATOM_PD_RANK_MAPPING_POLICY="none",
                 BENCHMARK_KIND=kind or cell["benchmark"]["kind"],
-                PREFILL_EXTRA_SERVER_ARGS=service["prefill"]["extra_args"],
-                DECODE_EXTRA_SERVER_ARGS=service["decode"]["extra_args"],
+                PREFILL_EXTRA_SERVER_ARGS=(
+                    service["prefill"]["extra_args"]
+                    if prefill_extra is None
+                    else prefill_extra
+                ),
+                DECODE_EXTRA_SERVER_ARGS=(
+                    service["decode"]["extra_args"]
+                    if decode_extra is None
+                    else decode_extra
+                ),
                 ROUTER_PORT="8000",
                 PROMETHEUS_PORT="29100",
                 RUNTIME_LOG_DIR="/tmp",
-                xP="1",
+                xP=xP,
             ),
             check=True,
             capture_output=True,
@@ -155,31 +165,14 @@ start_router
         self.assertIn("--dp-aware", args)
 
     def test_agentic_multi_prefill_pins_prefill_once(self):
-        cell = self.cells[0]
-        result = subprocess.run(
-            ["bash", "-eu", "-c", self.script],
-            cwd=ROOT,
-            env=dict(
-                self.env | cell["env"]["common"],
-                ROUTER_POLICY="cache_aware",
-                ATOMESH_MESH_BINARY="/test/atomesh",
-                ATOM_PD_RANK_MAPPING_POLICY="none",
-                BENCHMARK_KIND="aiperf_agentic",
-                PREFILL_EXTRA_SERVER_ARGS="",
-                DECODE_EXTRA_SERVER_ARGS="",
-                ROUTER_PORT="8000",
-                PROMETHEUS_PORT="29100",
-                RUNTIME_LOG_DIR="/tmp",
-                xP="2",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
+        args = self.router_args(
+            self.cells[0],
+            policy="cache_aware",
+            kind="aiperf_agentic",
+            xP="2",
+            prefill_extra="",
+            decode_extra="",
         )
-        args = [
-            line[4:] for line in result.stdout.splitlines() if line.startswith("ARG:")
-        ]
         self.assertEqual(args.count("--prefill-policy"), 1)
         self.assertEqual(args[args.index("--prefill-policy") + 1], "dp_sticky")
         self.assertEqual(args[args.index("--policy") + 1], "cache_aware")
