@@ -43,29 +43,6 @@ backends:
         policy: random
         prometheus_port: 29100
 
-# Shared AgentX replay. Referenced by every 1M agentic cell.
-agentic_1m_aiperf: &agentic_1m_aiperf
-  kind: aiperf_agentic
-  scenario: agentx
-  public_dataset: semianalysis_cc_traces_weka_062126
-  apply_chat_template: true
-  max_context_length: 1048576
-  num_dataset_entries: 393
-  benchmark_duration: 3600
-  warmup_requests_per_lane: 10
-  trace_idle_gap_cap_seconds: 300
-  warmup_grace_period: 1800
-  trajectory_start_min_ratio: 0.25
-  trajectory_start_max_ratio: 0.75
-  failed_request_threshold: 0.10
-  slice_duration: 1.0
-  cancel_drain_timeout: 300
-  http_tcp_user_timeout: 900000
-  dataset_configuration_timeout: 1800
-  service_profile_configure_timeout: 1800
-  wait_server_timeout: 4500
-  wait_router_timeout: 600
-
 models:
   DeepSeek-V4-Pro:
     backend: atom
@@ -261,36 +238,6 @@ models:
           run_eval: true
           eval_concurrency: [128, 512]
 
-      accuracy:
-        # 0.95: the per-request state pool does not fit at 0.85.
-        - &dsv4_moriio_gsm8k
-          name: ds-v4-1p1d-tp8-moriio-gsm8k
-          topology: 1p1d_tp8_moriio
-          nodes: "${ATOMESH_1P1D_NODES}"
-          isl: [8192]
-          osl: 1024
-          concurrency: [64]
-          server:
-            common_args:
-              gpu_memory_utilization: 0.95
-          env:
-            common:
-              KV_CONNECTOR: moriio
-              ATOM_MORIIO_MODE: write
-          benchmark:
-            wait_server_timeout: 4500
-          run_eval: true
-          eval_only: true
-          accuracy:
-            threshold: 0.90
-        - <<: *dsv4_moriio_gsm8k
-          name: ds-v4-2p1d-tp8-moriio-gsm8k
-          topology: 2p1d_tp8_moriio
-          nodes: "${ATOMESH_2P1D_NODES}"
-          prefill:
-            workers: 2
-
-      agentic:
         - &dsv4_moriio_agentic_c1
           name: ds-v4-1p1d-tp8-moriio-agentic-1m-c1
           topology: 1p1d_tp8_moriio
@@ -316,10 +263,59 @@ models:
             common:
               KV_CONNECTOR: moriio
               ATOM_MORIIO_MODE: write
-          benchmark: *agentic_1m_aiperf
+          benchmark: &agentic_1m_aiperf
+            kind: aiperf_agentic
+            scenario: agentx
+            public_dataset: semianalysis_cc_traces_weka_062126
+            apply_chat_template: true
+            max_context_length: 1048576
+            num_dataset_entries: 393
+            benchmark_duration: 3600
+            warmup_requests_per_lane: 10
+            trace_idle_gap_cap_seconds: 300
+            warmup_grace_period: 1800
+            trajectory_start_min_ratio: 0.25
+            trajectory_start_max_ratio: 0.75
+            failed_request_threshold: 0.10
+            slice_duration: 1.0
+            cancel_drain_timeout: 300
+            http_tcp_user_timeout: 900000
+            dataset_configuration_timeout: 1800
+            service_profile_configure_timeout: 1800
+            wait_server_timeout: 4500
+            wait_router_timeout: 600
           run_eval: false
         - <<: *dsv4_moriio_agentic_c1
           name: ds-v4-2p1d-tp8-moriio-agentic-1m-c1
+          topology: 2p1d_tp8_moriio
+          nodes: "${ATOMESH_2P1D_NODES}"
+          prefill:
+            workers: 2
+
+      accuracy:
+        # 0.95: the per-request state pool does not fit at 0.85.
+        - &dsv4_moriio_gsm8k
+          name: ds-v4-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          server:
+            common_args:
+              gpu_memory_utilization: 0.95
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          accuracy:
+            threshold: 0.90
+        - <<: *dsv4_moriio_gsm8k
+          name: ds-v4-2p1d-tp8-moriio-gsm8k
           topology: 2p1d_tp8_moriio
           nodes: "${ATOMESH_2P1D_NODES}"
           prefill:
