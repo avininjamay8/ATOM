@@ -267,8 +267,6 @@ models:
           prefill:
             workers: 2
 
-      # AgentX replay at concurrency 1. Same MoRIIO write topology as the gsm8k
-      # cells above. 2P1D is the 1P1D cell with a second prefill worker.
       agentic:
         - &dsv4_moriio_agentic_c1
           name: ds-v4-1p1d-tp8-moriio-agentic-1m-c1

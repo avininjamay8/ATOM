@@ -2077,8 +2077,6 @@ start_router() {
   local -a router_policy_args=(--policy "${router_policy}")
   if [[ "${router_policy}" == "cache_aware" ]]; then
     # Keep the InferenceX defaults, with a case-level absolute-load override.
-    # Multi-prefill already set --prefill-policy dp_sticky. Adding it again
-    # makes atomesh reject the launch.
     router_policy_args+=(
       --cache-threshold 0.8
       --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
