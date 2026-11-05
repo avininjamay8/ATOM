@@ -266,13 +266,11 @@ models:
           prefill:
             workers: 2
         # Wide EP. Decode uses MoRI low latency. One node is DPA8+EP8.
+        # server replaces the TP8 cell's 0.95, which this shape does not use.
         - &dsv4_ep_moriio
+          <<: *dsv4_moriio_gsm8k
           name: ds-v4-1p1d-dpa8-ep8-ll-moriio-gsm8k
           topology: 1p1d_dpa8_ep8_ll_moriio
-          nodes: "${ATOMESH_1P1D_NODES}"
-          isl: [8192]
-          osl: 1024
-          concurrency: [64]
           prefill: &dsv4_ep_prefill
             extra_args: "--enable-dp-attention --enable-expert-parallel"
           decode: &dsv4_ep_decode
@@ -291,10 +289,6 @@ models:
               ATOM_MORI_V1_LL: "1"
           benchmark:
             wait_server_timeout: 7200
-          run_eval: true
-          eval_only: true
-          accuracy:
-            threshold: 0.90
         # One prefill and one decode worker, each DPA16+EP16 across two nodes.
         - <<: *dsv4_ep_moriio
           name: ds-v4-2p2d-dpa16-ep16-ll-moriio-gsm8k
