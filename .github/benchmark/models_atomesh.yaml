@@ -286,7 +286,6 @@ models:
           env:
             common: &dsv4_ep_env
               KV_CONNECTOR: moriio
-              ATOM_MORIIO_MODE: write
               MORI_SHMEM_HEAP_SIZE: 16G
               HSA_NO_SCRATCH_RECLAIM: "1"
             decode: &dsv4_ep_decode_env
@@ -315,7 +314,6 @@ models:
           env:
             common:
               <<: *dsv4_ep_env
-              MORI_ENABLE_HOST_PROXY: "1"
               ATOM_DP_LM_HEAD_MODE: default
             decode:
               <<: *dsv4_ep_decode_env
