@@ -279,7 +279,6 @@ models:
           server:
             common_args: &dsv4_ep_args
               decode_max_num_seqs: 256
-              max_num_batched_tokens: 16384
           env:
             common: &dsv4_ep_env
               KV_CONNECTOR: moriio
@@ -312,7 +311,6 @@ models:
               <<: *dsv4_ep_decode_env
               MORI_EP_BLOCK_NUM: "64"
               MORI_EP_RDMA_BLOCK_NUM: "32"
-              MORI_EP_WARP_PER_BLOCK: "8"
 
     accuracy:
       task: gsm8k
