@@ -176,6 +176,8 @@ class DeepSeekV3AttributionCellsTest(unittest.TestCase):
 LOW_LATENCY_DECODE_CELLS = {
     ("DeepSeek-V3", "1p1d_dpa8_ep8_ll_moriio"): (2, 1, True),
     ("DeepSeek-V3", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, True),
+    ("DeepSeek-V4-Pro", "1p1d_dpa8_ep8_ll_moriio"): (2, 1, False),
+    ("DeepSeek-V4-Pro", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, False),
     ("Kimi-K2.5-MXFP4", "1p1d_dpa8_ep8_ll_moriio"): (2, 1, False),
     ("Kimi-K2.5-MXFP4", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, False),
     ("Kimi-K3-MXFP4", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, False),
@@ -233,11 +235,16 @@ class LowLatencyDecodeCellsTest(unittest.TestCase):
                 for key in INTER_NODE_LL_GEOMETRY:
                     self.assertIsNone(env["decode"].get(key))
                 continue
-            decode = {key: env["decode"].get(key) for key in INTER_NODE_LL_GEOMETRY}
-            self.assertEqual(decode, INTER_NODE_LL_GEOMETRY)
+            # An unset warp count keeps aiter's default.
+            expected = dict(INTER_NODE_LL_GEOMETRY)
+            if "MORI_EP_WARP_PER_BLOCK" not in env["decode"]:
+                del expected["MORI_EP_WARP_PER_BLOCK"]
+            decode = {key: env["decode"].get(key) for key in expected}
+            self.assertEqual(decode, expected)
             self.assertEqual(cell["server_args"]["gpu_memory_utilization"], 0.70)
+            # Unset, the launcher turns the host proxy on for a worker spanning nodes.
             for role in ("prefill", "decode"):
-                self.assertEqual(env[role]["MORI_ENABLE_HOST_PROXY"], "1")
+                self.assertEqual(env[role].get("MORI_ENABLE_HOST_PROXY", "1"), "1")
                 self.assertEqual(env[role]["ATOM_DP_LM_HEAD_MODE"], "default")
 
     def test_only_fp8_moe_keeps_the_shared_expert_separate(self):
@@ -251,8 +258,9 @@ class LowLatencyDecodeCellsTest(unittest.TestCase):
             self.assertEqual(cell["env"]["common"]["KV_CONNECTOR"], "moriio")
             self.assertEqual(cell["env"]["common"]["MORI_SHMEM_HEAP_SIZE"], "16G")
             # MoRI sizes its EP buffers from this per-rank budget, and 32768
-            # overflows the 16 GiB heap at EP16.
-            self.assertLessEqual(cell["server_args"]["max_num_batched_tokens"], 16384)
+            # overflows the 16 GiB heap at EP16. Unset, the engine uses 16384.
+            batched = cell["server_args"].get("max_num_batched_tokens", 16384)
+            self.assertLessEqual(batched, 16384)
             self.assertTrue(cell["eval_only"])
             self.assertEqual(cell["accuracy"]["threshold"], 0.90)
 
